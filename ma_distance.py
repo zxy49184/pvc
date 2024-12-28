@@ -74,18 +74,7 @@ def preprocess_features(features):
 
 
 def compute_mahalanobis_for_patches(model, data_loader, scaler_pca_dict, device):
-    """
-    针对每个补丁计算马氏距离，支持五种特征：first_up, second_up, second_last_down, last_combined, bottleneck。
 
-    参数:
-    - model: 已加载的模型，用于提取特征。
-    - data_loader: 数据加载器，用于遍历数据。
-    - scaler_pca_dict: 每个特征对应的标准化、PCA、均值和协方差逆矩阵。
-    - device: 设备 (CPU 或 GPU)。
-
-    返回:
-    - patch_distances_dict: 包含每个特征的马氏距离及相关信息。
-    """
     model.eval()
     patch_distances_dict = {key: [] for key in scaler_pca_dict.keys()}
 
@@ -126,6 +115,7 @@ def compute_mahalanobis_for_patches(model, data_loader, scaler_pca_dict, device)
     return patch_distances_dict
 
 
+
 if __name__ == "__main__":
     # 数据路径
     train_dir = "/gris/gris-f/homelv/xzhuang/aggc/train_patches2"
@@ -154,7 +144,7 @@ if __name__ == "__main__":
     scaler_pca_dict = {}
     model.eval()
     with torch.no_grad():
-        for feature_name in ["first_up", "second_up", "second_last_down", "last_combined"]:
+        for feature_name in ["first_up", "second_up", "second_last_down", "last_combined", "bottleneck"]:
             print(f"Processing training features for: {feature_name}")
             train_all_features = []
             for images, scanners, img_groups, regions, img_paths in tqdm(train_loader, desc=f"Extracting {feature_name}"):
@@ -167,6 +157,7 @@ if __name__ == "__main__":
                     "second_up": second_up.cpu(),
                     "second_last_down": second_last_down.cpu(),
                     "last_combined": last_combined.cpu(),
+                    "bottleneck": bottleneck.cpu(),
                 }
 
                 features = feature_dict[feature_name]
@@ -189,11 +180,16 @@ if __name__ == "__main__":
 
     # 计算测试集的马氏距离
     patch_distances_dict = compute_mahalanobis_for_patches(model, test_loader, scaler_pca_dict, device)
-
     # 保存结果
+    output_dir = "/gris/gris-f/homelv/xzhuang/pvc"  
+    os.makedirs(output_dir, exist_ok=True)
+
     for feature_name, patch_distances in patch_distances_dict.items():
-        output_path = f"/path/to/output/patch_mahalanobis_distances_{feature_name}.json"
-        with open(output_path, "w") as f:
-            json.dump(patch_distances, f, indent=4)
-        print(f"Mahalanobis distances for {feature_name} saved to {output_path}")
+        output_path = os.path.join(output_dir, f"patch_mahalanobis_distances_{feature_name}.json")
+        try:
+            with open(output_path, "w") as f:
+                json.dump(patch_distances, f, indent=4)
+            print(f"Mahalanobis distances for {feature_name} saved to {output_path}")
+        except Exception as e:
+            print(f"Failed to save Mahalanobis distances for {feature_name}: {str(e)}")
 
