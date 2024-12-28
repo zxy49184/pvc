@@ -9,8 +9,8 @@ from sklearn.preprocessing import StandardScaler
 from scipy.spatial.distance import mahalanobis
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from unet import UNet
-import csv
+from unet3 import UNet
+
 
 class PatchMaskDataset:
     def __init__(self, root_dir, scanners=None, transform=None):
@@ -47,7 +47,9 @@ class PatchMaskDataset:
         img_path, scanner, img_group, region = self.samples[idx]
         image = Image.open(img_path).convert("RGB")
         if self.transform:
-            image = self.transform(image)
+            image = self.transform(image)  # 转换为张量
+        else:
+            raise ValueError("Transform is not defined. Please provide a valid transform to the dataset.")
         return image, scanner, img_group, region, img_path
 
 
@@ -73,7 +75,16 @@ def preprocess_features(features):
 
 def compute_mahalanobis_for_patches(model, data_loader, scaler_pca_dict, device):
     """
-    针对每个补丁计算马氏距离，支持四种特征。
+    针对每个补丁计算马氏距离，支持五种特征：first_up, second_up, second_last_down, last_combined, bottleneck。
+
+    参数:
+    - model: 已加载的模型，用于提取特征。
+    - data_loader: 数据加载器，用于遍历数据。
+    - scaler_pca_dict: 每个特征对应的标准化、PCA、均值和协方差逆矩阵。
+    - device: 设备 (CPU 或 GPU)。
+
+    返回:
+    - patch_distances_dict: 包含每个特征的马氏距离及相关信息。
     """
     model.eval()
     patch_distances_dict = {key: [] for key in scaler_pca_dict.keys()}
@@ -83,12 +94,13 @@ def compute_mahalanobis_for_patches(model, data_loader, scaler_pca_dict, device)
             images = images.to(device)
 
             # 提取模型输出，包括中间特征
-            logits, first_up, second_up, second_last_down, last_combined = model(images)
+            logits, first_up, second_up, second_last_down, last_combined, bottleneck = model(images)
             feature_dict = {
                 "first_up": first_up.cpu(),
                 "second_up": second_up.cpu(),
                 "second_last_down": second_last_down.cpu(),
                 "last_combined": last_combined.cpu(),
+                "bottleneck": bottleneck.cpu(),
             }
 
             for i, path in enumerate(img_paths):
@@ -97,10 +109,12 @@ def compute_mahalanobis_for_patches(model, data_loader, scaler_pca_dict, device)
                         feature = features[i].view(-1).numpy()
                         scaler, pca, train_mean, train_cov_inv = scaler_pca_dict[key]
 
+                        # 计算特征的马氏距离
                         feature_scaled = scaler.transform([feature])
                         feature_reduced = pca.transform(feature_scaled)
                         distance = mahalanobis(feature_reduced[0], train_mean, train_cov_inv)
 
+                        # 保存每个特征的马氏距离和其他元信息
                         patch_distances_dict[key].append({
                             "scanner": scanners[i],
                             "image_group": img_groups[i],
@@ -114,9 +128,9 @@ def compute_mahalanobis_for_patches(model, data_loader, scaler_pca_dict, device)
 
 if __name__ == "__main__":
     # 数据路径
-    train_dir = "/gris/gris-f/homelv/xzhuang/aggc/train_patches3"
-    test_dir = "/gris/gris-f/homelv/xzhuang/aggc/test_patches3"
-    device = torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
+    train_dir = "/gris/gris-f/homelv/xzhuang/aggc/train_patches2"
+    test_dir = "/gris/gris-f/homelv/xzhuang/aggc/test_patches2"
+    device = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
 
     # 加载模型
     model = UNet(n_channels=3, n_classes=1).to(device)
@@ -128,8 +142,13 @@ if __name__ == "__main__":
     else:
         raise FileNotFoundError("Model checkpoint not found.")
 
+    # 定义数据预处理
+    transform = transforms.Compose([
+        transforms.ToTensor()  # 将 PIL.Image 转为 PyTorch 张量
+    ])
+
     # 提取训练集特征
-    train_dataset = PatchMaskDataset(train_dir, scanners=["Akoya"])
+    train_dataset = PatchMaskDataset(train_dir, scanners=["Akoya"], transform=transform)
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=False)
 
     scaler_pca_dict = {}
@@ -140,7 +159,8 @@ if __name__ == "__main__":
             train_all_features = []
             for images, scanners, img_groups, regions, img_paths in tqdm(train_loader, desc=f"Extracting {feature_name}"):
                 images = images.to(device)
-                logits, first_up, second_up, second_last_down, last_combined = model(images)
+                logits, first_up, second_up, second_last_down, last_combined, bottleneck = model(images)
+                torch.cuda.empty_cache()  # 清理显存
 
                 feature_dict = {
                     "first_up": first_up.cpu(),
@@ -164,14 +184,16 @@ if __name__ == "__main__":
             print(f"Training features processed and PCA fitted for: {feature_name}")
 
     # 测试集马氏距离计算
-    test_dataset = PatchMaskDataset(test_dir, scanners=["Akoya", "KFBio", "Zeiss", "Leica", "Philips", "Olympus"])
-    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+    test_dataset = PatchMaskDataset(test_dir, scanners=["Akoya", "KFBio", "Zeiss", "Leica", "Philips", "Olympus"], transform=transform)
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
+    # 计算测试集的马氏距离
     patch_distances_dict = compute_mahalanobis_for_patches(model, test_loader, scaler_pca_dict, device)
 
     # 保存结果
     for feature_name, patch_distances in patch_distances_dict.items():
-        output_path = f"/gris/gris-f/homelv/xzhuang/pvc/patch_mahalanobis_distances_{feature_name}.json"
+        output_path = f"/path/to/output/patch_mahalanobis_distances_{feature_name}.json"
         with open(output_path, "w") as f:
             json.dump(patch_distances, f, indent=4)
         print(f"Mahalanobis distances for {feature_name} saved to {output_path}")
+
