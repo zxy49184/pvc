@@ -1,0 +1,398 @@
+import pandas as pd
+import torch
+import os
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset, random_split
+from scipy.signal import butter, lfilter
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider
+
+# 允许重复加载 OpenMP
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+# 限制 PyTorch 使用单线程
+torch.set_num_threads(1)
+
+# 滑动窗口平滑函数
+def smooth_data(data, window_size=3):
+    return np.convolve(data, np.ones(window_size)/window_size, mode='same')
+
+
+class SlidingWindowDataset(torch.utils.data.Dataset):
+    def __init__(self, data, labels, window_size, step_size):
+        self.data = data
+        self.labels = labels
+        self.window_size = window_size
+        self.step_size = step_size
+
+    def __len__(self):
+        return (len(self.data) - self.window_size) // self.step_size + 1
+
+    def __getitem__(self, idx):
+        start = idx * self.step_size
+        end = start + self.window_size
+        window_data = self.data[start:end].unsqueeze(0)  # 添加通道维度
+        window_label = self.labels[start:end].mean(dim=0)  # 标签取均值
+
+        # 处理 NaN
+        if torch.isnan(window_data).any():
+            window_data = torch.nan_to_num(window_data, nan=0.0)
+        return window_data, window_label
+
+
+# 低通滤波器函数
+def lowpass_filter(data, cutoff, fs, order=4):
+    nyquist = 0.5 * fs  # Nyquist 频率
+    normal_cutoff = cutoff / nyquist  # 归一化截止频率
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)  # 设计滤波器
+    return lfilter(b, a, data)  # 单向滤波
+
+
+def calculate_weights(target, high_weight=10.0, low_weight=1.0):
+
+    # 转换为 NumPy 数组
+    target_np = target.squeeze().cpu().numpy()
+
+    # 检测极值点
+    max_indices = (target_np == target_np.max())
+    min_indices = (target_np == target_np.min())
+
+    # 初始化权重
+    weights = np.full_like(target_np, low_weight, dtype=np.float32)
+    weights[max_indices] = high_weight  # 最大值权重
+    weights[min_indices] = high_weight  # 最小值权重
+
+    # 转换回 Torch 张量
+    return torch.tensor(weights, dtype=torch.float32, device=target.device)
+def weighted_mse_loss(output, target, weight):
+    """
+    加权 MSE 损失函数
+    参数:
+        output (torch.Tensor): 模型预测值
+        target (torch.Tensor): 实际目标值
+        weight (torch.Tensor): 权重张量，与 target 形状相同
+    返回:
+        torch.Tensor: 加权 MSE 损失
+    """
+    return (weight * (output - target) ** 2).mean()
+
+# 读取CSV文件
+#file_path = r"E:\motion_data\motion_data_with_ground_truth.csv"
+file_path = r"E:\motion_data\output\motion_data_with_ground_truth_-0.2_15.csv"
+data = pd.read_csv(file_path)
+# 提取文件名（不含路径和扩展名）
+file_name = os.path.splitext(os.path.basename(file_path))[0]
+
+# 创建保存目录（如果需要）
+output_dir = "E:/motion_data/visualizations"
+os.makedirs(output_dir, exist_ok=True)
+
+# 定义保存路径
+output_path_actual_predicted = os.path.join(output_dir, f"{file_name}_actual_vs_predicted.png")
+output_path_difference = os.path.join(output_dir, f"{file_name}_difference_curve.png")
+# 数据裁剪预处理
+#data['imu_acc_x'] = data['imu_acc_x'].clip(-10, 5)
+#data['imu_acc_y'] = data['imu_acc_y'].clip(-10, 5)
+#data['imu_ang_acc_z'] = data['imu_ang_acc_z'].clip(-40, 20)
+
+# 对特定列进行低通滤波
+cutoff_freq = 5.0  # Cutoff frequency (Hz)
+fs = 100  # Sampling frequency (Hz)
+
+filtered_columns = ['imu_acc_x', 'imu_acc_y', 'imu_acc_z', 'imu_ang_vel_x', 'imu_ang_vel_y', 'imu_ang_vel_z']
+
+for col in filtered_columns:
+    if col in data.columns:
+        filtered_data = lowpass_filter(data[col], cutoff_freq, fs)
+        data[f'{col}_filtered'] = np.nan_to_num(filtered_data, nan=0.0)
+
+# 定义输入特征和标签
+features = [f'{col}_filtered' for col in filtered_columns if f'{col}_filtered' in data.columns]
+label = 'gait_phase'
+
+X = data[features].values  # Filtered features as input
+y = data[label].values  # Target: gait_cycle
+
+# 转换为PyTorch张量
+X_tensor = torch.tensor(X, dtype=torch.float32)
+y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(1)  # Add an output dimension
+
+# 全局归一化
+X_min = X_tensor.min(dim=0, keepdim=True).values  # 全数据的最小值
+X_max = X_tensor.max(dim=0, keepdim=True).values  # 全数据的最大值
+constant_features = (X_max == X_min)  # 检测常量列
+
+# 避免分母为零
+X_tensor[:, ~constant_features[0]] = (X_tensor[:, ~constant_features[0]] - X_min[:, ~constant_features[0]]) / (
+    X_max[:, ~constant_features[0]] - X_min[:, ~constant_features[0]]
+)
+
+# 对常量列填充零或特定值
+X_tensor[:, constant_features[0]] = 0.0  # 这里假设常量列填充为0
+# 平滑处理
+for i in range(X_tensor.shape[1]):
+    X_tensor[:, i] = torch.tensor(smooth_data(X_tensor[:, i].numpy(), window_size=5))
+
+# 调整为 CNN 需要的输入形状
+X_tensor = X_tensor.unsqueeze(1)  # Add channel dimension (batch_size, channels, sequence_length)
+
+# 打印数据的部分内容
+print("Original Data (First 5 Rows):")
+print(data[filtered_columns].head())
+
+# 打印归一化后的张量
+print("\nNormalized Tensor Shape:", X_tensor.shape)
+print("First 5 Rows of Normalized Tensor:")
+print(X_tensor[:5])
+
+
+# 数据集划分为训练集和验证集
+dataset = TensorDataset(X_tensor, y_tensor)
+train_size = int(0.8 * len(dataset))  # 80% for training
+val_size = len(dataset) - train_size
+train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+# 定义 CNN 模型
+class CNNModel(nn.Module):
+    def __init__(self, input_channels, output_size, hidden_channels=64, kernel_size=3, dropout=0.2):
+        super(CNNModel, self).__init__()
+        self.conv1 = nn.Conv1d(input_channels, hidden_channels, kernel_size=kernel_size, padding=1)
+        self.relu1 = nn.ReLU()
+        self.pool1 = nn.MaxPool1d(2)
+
+        self.conv2 = nn.Conv1d(hidden_channels, hidden_channels, kernel_size=kernel_size, padding=1)
+        self.relu2 = nn.ReLU()
+        self.pool2 = nn.MaxPool1d(2)
+
+        self.fc1 = nn.Linear(hidden_channels * (X_tensor.shape[2] // 4), hidden_channels)
+        self.relu3 = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+        self.fc2 = nn.Linear(hidden_channels, output_size)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.relu1(x)
+        x = self.pool1(x)
+
+        x = self.conv2(x)
+        x = self.relu2(x)
+        x = self.pool2(x)
+
+        x = x.view(x.size(0), -1)  # Flatten
+        x = self.fc1(x)
+        x = self.relu3(x)
+        x = self.dropout(x)
+
+        x = self.fc2(x)
+        x = self.sigmoid(x)
+        return x
+
+# 超参数
+input_channels = 1  # 单通道输入
+output_size = 1  # 目标输出
+hidden_channels = 64
+num_epochs = 10
+batch_size = 128
+learning_rate = 0.0005
+window_size = 100
+step_size = 10
+# 初始化模型、损失函数和优化器
+model = CNNModel(input_channels=input_channels, output_size=output_size, hidden_channels=hidden_channels)
+criterion = nn.MSELoss()  # Mean Squared Error loss
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+# 定义学习率调度器
+scheduler = ReduceLROnPlateau(
+    optimizer,
+    mode='min',
+    factor=0.1,
+    patience=5,
+    threshold=1e-3,
+    cooldown=0,
+    min_lr=1e-8
+)
+
+dataset = SlidingWindowDataset(X_tensor, y_tensor, window_size, step_size)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+model_output_dir = "E:/motion_data/models"
+os.makedirs(model_output_dir, exist_ok=True)
+# 检查是否有已保存的模型和优化器状态
+model_save_path = os.path.join(model_output_dir, f"{file_name}_model.pth")
+# 检查是否有已保存的模型和优化器状态
+if os.path.exists(model_save_path):
+    checkpoint = torch.load(model_save_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    print(f"Loaded model and optimizer state from {model_save_path}")
+else:
+    print("No checkpoint found, starting from scratch.")
+
+# 训练循环
+for epoch in range(num_epochs):
+    model.train()
+    train_loss = 0
+    for batch_X, batch_y in train_loader:
+        optimizer.zero_grad()
+
+        # 模型预测
+        outputs = model(batch_X)
+
+        # 计算权重
+        weights = calculate_weights(batch_y, high_weight=10.0, low_weight=1.0)
+
+        # 计算加权损失
+        loss = weighted_mse_loss(outputs, batch_y, weights)
+
+        # 反向传播
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        train_loss += loss.item()
+
+    # 验证阶段
+    model.eval()
+    val_loss = 0
+    with torch.no_grad():
+        for batch_X, batch_y in val_loader:
+            outputs = model(batch_X)
+            weights = calculate_weights(batch_y, high_weight=10.0, low_weight=1.0)
+            loss = weighted_mse_loss(outputs, batch_y, weights)
+            val_loss += loss.item()
+    val_loss /= len(val_loader)
+    # 更新学习率
+    scheduler.step(val_loss)
+
+    # 打印当前学习率
+    current_lr = optimizer.param_groups[0]['lr']
+    print(f"Epoch [{epoch + 1}/{num_epochs}], Train Loss: {train_loss / len(train_loader):.4f}, "
+          f"Val Loss: {val_loss:.4f}, LR: {current_lr:.6f}")
+
+    # 保存模型和优化器状态
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict()
+    }, model_save_path)
+    print(f"Checkpoint saved to {model_save_path}")
+
+# 加载模型
+checkpoint = torch.load(model_save_path)
+model.load_state_dict(checkpoint['model_state_dict'])
+model.eval()
+print(f"Model loaded from {model_save_path}")
+
+with torch.no_grad():
+    y_pred = model(X_tensor).squeeze().numpy()
+
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider
+
+visible_time_range = 2000  # 显示范围（时间步数）
+fig_width_cm = visible_time_range / 50  # 图像宽度（1厘米对应50时间步）
+fig_height = 8  # 图像高度
+
+# 转换为英寸 (1英寸=2.54厘米)
+fig_width_inches = fig_width_cm / 2.54
+fig_height_inches = fig_height / 2.54
+
+# 创建图形和子图
+fig, ax = plt.subplots(figsize=(fig_width_inches, fig_height_inches))  # Dynamic width
+current_start_time = 0  # Current start time index
+
+
+# 更新绘图函数
+def update_plot(start_time):
+    ax.clear()
+    # Define the visible time range
+    end_time = start_time + visible_time_range
+    actual_data = y_tensor.numpy()[int(start_time):int(end_time)]
+    predicted_data = y_pred[int(start_time):int(end_time)]
+
+    # Plot actual and predicted data
+    ax.plot(actual_data, label='Actual', color='blue', linestyle='-', linewidth=1.5)
+    ax.plot(predicted_data, label='Predicted', color='red', linestyle='-', linewidth=1.5)
+
+    # Add labels, title, and grid
+    ax.set_xlabel('Time Step', fontsize=12)
+    ax.set_ylabel('Gait Cycle Value', fontsize=12)
+    ax.set_title('Actual vs Predicted Gait Cycle', fontsize=16)
+    ax.legend(loc='upper right', fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+    plt.draw()  # Redraw the plot
+
+
+# 初始绘图
+update_plot(current_start_time)
+
+# 添加横向滚动条
+slider_ax_time = plt.axes([0.1, 0.02, 0.8, 0.03], facecolor='lightgrey')  # Slider position
+slider_time = Slider(
+    slider_ax_time,
+    'Time Scroll',
+    0,
+    max(0, len(y_tensor.numpy()) - visible_time_range),
+    valinit=0,
+    valstep=1
+)
+
+
+# 滑动条事件绑定
+def on_time_slider_update(val):
+    global current_start_time
+    current_start_time = slider_time.val
+    update_plot(current_start_time)
+
+
+slider_time.on_changed(on_time_slider_update)
+
+
+plt.tight_layout(rect=[0.05, 0.1, 0.95, 0.95])  # Adjust layout for sliders
+
+
+
+difference = y_tensor.numpy().squeeze() - y_pred.squeeze()
+# 创建差异曲线图
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(difference[:visible_time_range], label='Difference (Actual - Predicted)', color='purple', linestyle='-', linewidth=1.5)
+
+# 设置标签和标题
+ax.set_xlabel('Time Step', fontsize=12)
+ax.set_ylabel('Difference Value', fontsize=12)
+ax.set_title('Difference Curve: Actual - Predicted', fontsize=16)
+ax.legend(loc='upper right', fontsize=10)
+ax.grid(True, linestyle='--', alpha=0.5)
+
+plt.tight_layout()
+
+plt.show()
+
+
+# 保存实际值和预测值的对比图
+update_plot(current_start_time)  # 确保绘图已更新
+fig.savefig(output_path_actual_predicted, dpi=300, bbox_inches='tight')
+print(f"Actual vs Predicted plot saved to {output_path_actual_predicted}")
+
+# 保存差异曲线图
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(difference[:visible_time_range], label='Difference (Actual - Predicted)', color='purple', linestyle='-', linewidth=1.5)
+ax.set_xlabel('Time Step', fontsize=12)
+ax.set_ylabel('Difference Value', fontsize=12)
+ax.set_title('Difference Curve: Actual - Predicted', fontsize=16)
+ax.legend(loc='upper right', fontsize=10)
+ax.grid(True, linestyle='--', alpha=0.5)
+plt.tight_layout()
+fig.savefig(output_path_difference, dpi=300, bbox_inches='tight')
+print(f"Difference curve plot saved to {output_path_difference}")
+# 误差分析
+differences = np.abs(y_tensor.numpy() - y_pred)
+print(f"Max Difference: {differences.max()}")
+print(f"Min Difference: {differences.min()}")
+print(f"Mean Difference: {differences.mean()}")
